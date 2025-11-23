@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Consulta de Sucursales</title>
+
+  <!-- Librería XLSX -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <style>
+    body { 
+      font-family: Arial, sans-serif; 
+      margin:0; 
+      padding:30px;
+      background-image:url('Fondo1.png');
+      background-size:cover; 
+      background-position:center; 
+      color:#fff; 
+      transition: background-image .5s ease;
+    }
+    h2 { text-shadow:1px 1px 4px #000; }
+    input, select, button { margin:5px; padding:10px; font-size:16px; border-radius:5px; border:none; }
+    select { width:250px; } 
+    input[type="text"] { width:230px; }
+    #filtros { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px; }
+    button { background:#00796b; color:#fff; cursor:pointer; }
+    button:hover { background:#004d40; }
+    .boton-limpiar { background:#e53935; } 
+    .boton-limpiar:hover { background:#b71c1c; }
+    .card { 
+      background:rgba(255,255,255,0.95); 
+      color:#000; 
+      border-radius:5px; 
+      margin-top:10px; 
+      padding:10px; 
+      box-shadow:0 2px 5px rgba(0,0,0,0.3); 
+    }
+    .sucursal-btn { 
+      width:100%; 
+      text-align:left; 
+      background:#4caf50; 
+      color:#fff; 
+      border:none; 
+      padding:10px; 
+      font-size:16px; 
+      border-radius:4px; 
+      cursor:pointer; 
+    }
+    .sucursal-btn:hover { background:#388e3c; }
+    .card-content { display:none; padding-top:10px; border-top:1px solid #ccc; }
+    .card-content div { margin-bottom:4px; }
+    select:disabled { opacity:0.6; }
+    #resultado { margin-top:20px; }
+    #resumenGerente table { border-collapse: collapse; margin-top:10px; }
+    #resumenGerente th, #resumenGerente td { border:1px solid #333; padding:6px; }
+    #resumenGerente th { background:#00796b; color:#fff; }
+    #resumenGerente td { background:#fff; color:#000; }
+    .controls { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+    .small { font-size:13px; color: #ddd; }
+  </style>
+</head>
+
+<body>
+
+<h2>Consulta de Sucursales</h2>
+
+<div class="controls">
+  <button onclick="filtrar()">Buscar</button>
+  <button onclick="limpiarBusqueda()" class="boton-limpiar">Limpiar búsqueda</button>
+  <button id="btnVolver">Volver a búsqueda anterior</button>
+  <a class="small" href="./Directorio Consolidado.xlsx" target="_blank">Abrir Excel</a>
+</div>
+
+<div id="filtros">
+  <input type="text" id="codigo" placeholder="Código Sucursal">
+  <input type="text" id="nombre" placeholder="Nombre Sucursal">
+
+  <select id="cluster"><option value="">-- Clúster --</option></select>
+  <select id="gerente"><option value="">-- Gerente --</option></select>
+  <select id="director"><option value="">-- Director/Subdirector --</option></select>
+  <select id="coordinador"><option value="">-- Coordinador/Supervisor --</option></select>
+  <select id="region"><option value="">-- Región Económica --</option></select>
+  <select id="departamento"><option value="">-- Departamento --</option></select>
+  <select id="ciudad"><option value="">-- Ciudad --</option></select>
+</div>
+
+<div id="resumenGerente"></div>
+<div id="resultado"></div>
+
+<script>
+/* ============================================
+   VARIABLES GLOBALES
+============================================ */
+let datos = [];
+let KEYS = {};
+let HEADERS = [];
+let listenersConfigurados = false;
+let backgrounds = [];
+let prevState = null;
+
+/* Normalizar texto */
+function n(str) {
+  return (str ?? "").toString().trim()
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/\s+/g,' ');
+}
+/* ============================================
+   MAPEO AUTOMÁTICO DE ENCABEZADOS
+============================================ */
+const CANDIDATOS = {
+  cod_suc: ["cod. suc","codigo sucursal","codigo","cod suc","id sucursal"],
+  nombre_suc: ["nombre sucursal","sucursal","nombre"],
+  cluster: ["clúster","cluster"],
+  gerente: ["gerente"],
+  director: ["director/subdirector","director","subdirector"],
+  coordinador: ["coordinador/supervisor","coordinador","supervisor"],
+  region: ["región económica","region economica","regional","región"],
+  departamento: ["departamento","dpto"],
+  ciudad: ["ciudad","municipio","poblacion","población"]
+};
+
+function mapearHeaders(row) {
+  const llaves = Object.keys(row || {});
+  HEADERS = llaves;
+  const indiceNorm = {};
+  llaves.forEach(k => indiceNorm[n(k)] = k);
+
+  for (const canon in CANDIDATOS) {
+    let encontrada = null;
+    for (const alias of CANDIDATOS[canon]) {
+      if (indiceNorm[n(alias)]) { encontrada = indiceNorm[n(alias)]; break; }
+    }
+    if (!encontrada) {
+      for (const alias of CANDIDATOS[canon]) {
+        const aliasNorm = n(alias);
+        for (const llave of llaves) {
+          const ln = n(llave);
+          if (ln.includes(aliasNorm) || aliasNorm.includes(ln)) {
+            encontrada = llave; break;
+          }
+        }
+        if (encontrada) break;
+      }
+    }
+    if (encontrada) KEYS[canon] = encontrada;
+  }
+}
+
+/* ============================================
+   FILTRADO JERÁRQUICO
+============================================ */
+const sel = { cluster:"", gerente:"", director:"", coordinador:"", region:"", departamento:"", ciudad:"" };
+function valSel(id) { return n(document.getElementById(id).value); }
+
+function filtrarRows(base=datos) {
+  let rows = base;
+
+  if (sel.gerente && KEYS.gerente) rows = rows.filter(r => n(r[KEYS.gerente]) === sel.gerente);
+  if (sel.director && KEYS.director) rows = rows.filter(r => n(r[KEYS.director]) === sel.director);
+  if (sel.coordinador && KEYS.coordinador) rows = rows.filter(r => n(r[KEYS.coordinador]) === sel.coordinador);
+  if (sel.region && KEYS.region) rows = rows.filter(r => n(r[KEYS.region]) === sel.region);
+  if (sel.departamento && KEYS.departamento) rows = rows.filter(r => n(r[KEYS.departamento]) === sel.departamento);
+  if (sel.ciudad && KEYS.ciudad) rows = rows.filter(r => n(r[KEYS.ciudad]) === sel.ciudad);
+  if (sel.cluster && KEYS.cluster) rows = rows.filter(r => n(r[KEYS.cluster]) === sel.cluster);
+
+  return rows;
+}
+
+function valoresUnicosDisplay(rows, fieldKey) {
+  const mapa = new Map();
+  rows.forEach(r => {
+    const display = (r[fieldKey] ?? "").toString().trim();
+    const norm = n(display);
+    if (norm && !mapa.has(norm)) mapa.set(norm, display);
+  });
+  return [...mapa.entries()].sort((a,b)=> a[1].localeCompare(b[1]));
+}
+
+function setOpciones(id, lista) {
+  const el = document.getElementById(id);
+  const placeholder = el.options[0].textContent;
+  const keep = el.getAttribute("data-keep") || "";
+
+  el.innerHTML = `<option value="">${placeholder}</option>`;
+  lista.forEach(([norm, display]) => {
+    if ((id === "director" || id === "coordinador") && n(display) === "no asignado") return;
+    const o = document.createElement("option");
+    o.value = display;
+    o.textContent = display;
+    el.appendChild(o);
+  });
+
+  el.disabled = lista.length === 0;
+
+  if (keep) {
+    for (const opt of el.options) {
+      if (n(opt.value) === n(keep)) { el.value = opt.value; break; }
+    }
+    el.removeAttribute("data-keep");
+  }
+}
+
+function refrescarCombos() {
+  const base = filtrarRows(datos);
+  setOpciones("gerente", valoresUnicosDisplay(base, KEYS.gerente));
+  setOpciones("director", valoresUnicosDisplay(base, KEYS.director));
+  setOpciones("coordinador", valoresUnicosDisplay(base, KEYS.coordinador));
+  setOpciones("region", valoresUnicosDisplay(base, KEYS.region));
+  setOpciones("departamento", valoresUnicosDisplay(base, KEYS.departamento));
+  setOpciones("ciudad", valoresUnicosDisplay(base, KEYS.ciudad));
+  setOpciones("cluster", valoresUnicosDisplay(base, KEYS.cluster));
+}
+
+function sincronizarEstado() {
+  sel.gerente      = valSel("gerente");
+  sel.director     = valSel("director");
+  sel.coordinador  = valSel("coordinador");
+  sel.region       = valSel("region");
+  sel.departamento = valSel("departamento");
+  sel.ciudad       = valSel("ciudad");
+  sel.cluster      = valSel("cluster");
+}
+
+function configurarListeners() {
+  if (listenersConfigurados) return;
+
+  ["gerente","director","coordinador","region","departamento","ciudad","cluster"]
+    .forEach(id => {
+      document.getElementById(id).addEventListener("change", () => {
+        sincronizarEstado();
+        document.getElementById(id).setAttribute("data-keep", document.getElementById(id).value);
+        refrescarCombos();
+      });
+    });
+
+  listenersConfigurados = true;
+}
+
+/* ============================================
+   CARGA AUTOMÁTICA DEL ARCHIVO EXCEL
+============================================ */
+async function cargarExcelAutomatico() {
+  try {
+    const resp = await fetch("Directorio Consolidado.xlsx");
+    if (!resp.ok) {
+      console.warn("No se pudo cargar automáticamente el archivo.");
+      return;
+    }
+
+    const buffer = await resp.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type:"array" });
+
+    const hoja = workbook.Sheets["Directorio Consolidado"] ||
+                 workbook.Sheets[workbook.SheetNames[0]];
+
+    datos = XLSX.utils.sheet_to_json(hoja, { defval:"" });
+    if (!datos.length) return;
+
+    mapearHeaders(datos[0]);
+    configurarListeners();
+    Object.keys(sel).forEach(k => sel[k] = "");
+    refrescarCombos();
+
+    console.log("Excel cargado automáticamente:", datos.length, "registros");
+  } catch(err) {
+    console.error("Error al cargar Excel automáticamente:", err);
+  }
+}
+/* ============================================
+   DETECCIÓN DE FONDOS ALEATORIOS
+============================================ */
+async function detectarFondos() {
+  const posibles = [];
+  for (let i = 1; i <= 12; i++) {
+    posibles.push(`Fondo${i}.png`, `Fondo${i}.jpg`, `fondo${i}.png`, `fondo${i}.jpg`);
+  }
+  posibles.push("Fondo-Videollamada-Punto-1000.png");
+
+  const encontrados = [];
+  for (const archivo of posibles) {
+    try {
+      const r = await fetch(archivo, { method:"HEAD" });
+      if (r.ok) encontrados.push(archivo);
+    } catch(e) {}
+  }
+  backgrounds = encontrados;
+}
+
+/* ============================================
+   GUARDAR / RESTAURAR ESTADO PREVIO
+============================================ */
+function savePrevState() {
+  prevState = {
+    filtros: {
+      codigo: document.getElementById("codigo").value,
+      nombre: document.getElementById("nombre").value,
+      gerente: document.getElementById("gerente").value,
+      director: document.getElementById("director").value,
+      coordinador: document.getElementById("coordinador").value,
+      region: document.getElementById("region").value,
+      departamento: document.getElementById("departamento").value,
+      ciudad: document.getElementById("ciudad").value,
+      cluster: document.getElementById("cluster").value
+    },
+    resultados: document.getElementById("resultado").innerHTML,
+    resumen: document.getElementById("resumenGerente").innerHTML,
+    fondo: document.body.style.backgroundImage
+  };
+}
+
+function restorePrevState() {
+  if (!prevState) return alert("No hay búsqueda anterior.");
+
+  document.getElementById("codigo").value = prevState.filtros.codigo;
+  document.getElementById("nombre").value = prevState.filtros.nombre;
+
+  ["gerente","director","coordinador","region","departamento","ciudad","cluster"].forEach(selID => {
+    const el = document.getElementById(selID);
+    el.setAttribute("data-keep", prevState.filtros[selID]);
+  });
+
+  sincronizarEstado();
+  refrescarCombos();
+
+  document.getElementById("resultado").innerHTML = prevState.resultados;
+  document.getElementById("resumenGerente").innerHTML = prevState.resumen;
+  document.body.style.backgroundImage = prevState.fondo;
+}
+
+/* ============================================
+   FUNCIÓN PRINCIPAL DE BÚSQUEDA
+============================================ */
+async function filtrar() {
+  if (!datos.length) return alert("Aún no se ha cargado el archivo Excel.");
+
+  savePrevState(); // <-- guarda estado anterior
+
+  sincronizarEstado();
+
+  // quitar resumen del gerente si se hace una búsqueda normal
+  document.getElementById("resumenGerente").innerHTML = "";
+
+  // fondo aleatorio
+  if (backgrounds.length === 0) await detectarFondos();
+  if (backgrounds.length > 0) {
+    const img = backgrounds[Math.floor(Math.random() * backgrounds.length)];
+    document.body.style.backgroundImage = `url('${img}')`;
+  }
+
+  const txtCodigo = n(document.getElementById("codigo").value);
+  const txtNombre = n(document.getElementById("nombre").value);
+
+  let res = filtrarRows(datos);
+
+  res = res.filter(s => {
+    const okCod = !txtCodigo || (KEYS.cod_suc && n(String(s[KEYS.cod_suc])) === txtCodigo);
+    const okNom = !txtNombre || (KEYS.nombre_suc && n(String(s[KEYS.nombre_suc])).includes(txtNombre));
+    return okCod && okNom;
+  });
+
+  const cont = document.getElementById("resultado");
+  cont.innerHTML = "";
+
+  if (res.length === 0) {
+    cont.innerHTML = "<p>No se encontraron resultados.</p>";
+    return;
+  }
+
+  res.forEach((s, idx) => {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const btn = document.createElement("button");
+    btn.className = "sucursal-btn";
+    btn.textContent = s[KEYS.nombre_suc] || `Sucursal ${idx+1}`;
+
+    btn.onclick = () => {
+      const content = card.querySelector(".card-content");
+      content.style.display = content.style.display === "none" ? "block" : "none";
+
+      /* ====== LLENAR FILTROS AUTOMÁTICAMENTE ====== */
+      if (KEYS.cod_suc) document.getElementById("codigo").value = s[KEYS.cod_suc] || "";
+      if (KEYS.nombre_suc) document.getElementById("nombre").value = s[KEYS.nombre_suc] || "";
+
+      const pares = {
+        gerente:       KEYS.gerente,
+        director:      KEYS.director,
+        coordinador:   KEYS.coordinador,
+        region:        KEYS.region,
+        departamento:  KEYS.departamento,
+        ciudad:        KEYS.ciudad,
+        cluster:       KEYS.cluster
+      };
+
+      for (const id in pares) {
+        if (pares[id]) {
+          const el = document.getElementById(id);
+          el.setAttribute("data-keep", s[pares[id]] || "");
+        }
+      }
+
+      sincronizarEstado();
+      refrescarCombos();
+    };
+
+    const content = document.createElement("div");
+    content.className = "card-content";
+
+    Object.keys(s).forEach(k => {
+      const row = document.createElement("div");
+      row.innerHTML = `<strong>${k}:</strong> ${s[k] ?? "—"}`;
+      content.appendChild(row);
+    });
+
+    card.appendChild(btn);
+    card.appendChild(content);
+    cont.appendChild(card);
+  });
+
+  // Mantener selecciones después de buscar
+  ["gerente","director","coordinador","region","departamento","ciudad","cluster"].forEach(id => {
+    const el = document.getElementById(id);
+    el.setAttribute("data-keep", el.value);
+  });
+
+  sincronizarEstado();
+  refrescarCombos();
+}
+
+/* ============================================
+   LIMPIAR BÚSQUEDA
+============================================ */
+function limpiarBusqueda() {
+  document.getElementById("resultado").innerHTML = "";
+  document.getElementById("resumenGerente").innerHTML = "";
+
+  document.querySelectorAll("#filtros input").forEach(i => i.value = "");
+  
+  ["gerente","director","coordinador","region","departamento","ciudad","cluster"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.removeAttribute("data-keep"); el.selectedIndex = 0; }
+    sel[id] = "";
+  });
+
+  refrescarCombos();
+}
+
+/* ============================================
+   VOLVER A BÚSQUEDA ANTERIOR
+============================================ */
+document.getElementById("btnVolver").onclick = restorePrevState;
+
+/* ============================================
+   INICIALIZAR (Cargar Excel + Fondos)
+============================================ */
+(async function init() {
+  await detectarFondos();
+  await cargarExcelAutomatico(); 
+})();
+</script>
+
+</body>
+</html>
